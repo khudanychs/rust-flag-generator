@@ -1,318 +1,365 @@
 use wasm_bindgen::prelude::*;
 
 // ============================================================
-// Lightweight Xorshift32 PRNG
-// (the `rand` crate has issues on wasm32-unknown-unknown,
-//  so we ship our own deterministic generator.)
+// Xorshift32 PRNG
 // ============================================================
-struct Rng {
-    state: u32,
-}
+struct Rng { state: u32 }
 
 impl Rng {
     fn from_seed_f32(seed: f32) -> Self {
-        // splitmix32-style avalanche so adjacent seeds (e.g. 1.0 vs 1.1)
-        // produce drastically different streams.
         let bits = seed.to_bits().wrapping_add(0x9E37_79B9);
         let mut x = bits;
+        x ^= x >> 16; x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15; x = x.wrapping_mul(0x846c_a68b);
         x ^= x >> 16;
-        x = x.wrapping_mul(0x7feb_352d);
-        x ^= x >> 15;
-        x = x.wrapping_mul(0x846c_a68b);
-        x ^= x >> 16;
-        Self {
-            state: if x == 0 { 0xDEAD_BEEF } else { x },
-        }
+        Self { state: if x == 0 { 0xDEAD_BEEF } else { x } }
     }
-
-    #[inline]
-    fn next_u32(&mut self) -> u32 {
-        // Xorshift32 — period 2^32 - 1, sufficient for layout decisions.
+    #[inline] fn next_u32(&mut self) -> u32 {
         let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.state = x;
-        x
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        self.state = x; x
     }
-
-    #[inline]
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u32() as f32) / (u32::MAX as f32)
-    }
-
-    #[inline]
-    fn range(&mut self, n: u32) -> u32 {
-        self.next_u32() % n
-    }
+    #[inline] fn next_f32(&mut self) -> f32 { (self.next_u32() as f32) / (u32::MAX as f32) }
+    #[inline] fn range(&mut self, n: u32) -> u32 { self.next_u32() % n }
 }
 
 // ============================================================
-// Vexillological color palette (canonical flag colors)
+// Palette — Rule of Tincture
 // ============================================================
 type Rgb = [u8; 3];
 
-const PALETTE: &[Rgb] = &[
-    [0, 40, 104],    // Navy Blue
-    [191, 10, 48],   // Crimson
-    [255, 215, 0],   // Gold
-    [34, 139, 34],   // Forest Green
-    [255, 255, 255], // White
-    [12, 12, 12],    // Black (slight lift so fabric shading reads)
-    [0, 35, 149],    // Royal Blue
-    [206, 17, 38],   // Deep Red
-    [255, 153, 51],  // Saffron
-    [0, 153, 0],     // Pure Green
-    [65, 137, 221],  // Sky Blue
-    [128, 0, 32],    // Burgundy
+const METALS: &[Rgb] = &[
+    [255, 255, 255],
+    [255, 215, 0],
+    [255, 153, 51],
 ];
 
-/// Pick `count` distinct colors from the palette.
-fn pick_distinct(rng: &mut Rng, count: usize) -> Vec<Rgb> {
-    let mut chosen: Vec<Rgb> = Vec::with_capacity(count);
-    let mut attempts = 0;
-    while chosen.len() < count && attempts < 64 {
-        let c = PALETTE[rng.range(PALETTE.len() as u32) as usize];
-        if !chosen.iter().any(|p| *p == c) {
-            chosen.push(c);
+const COLORS: &[Rgb] = &[
+    [0, 40, 104],
+    [191, 10, 48],
+    [34, 139, 34],
+    [12, 12, 12],
+    [0, 35, 149],
+    [206, 17, 38],
+    [0, 153, 0],
+    [65, 137, 221],
+    [128, 0, 32],
+];
+
+#[inline]
+fn color_dist_sq(a: Rgb, b: Rgb) -> f32 {
+    let dr = a[0] as f32 - b[0] as f32;
+    let dg = a[1] as f32 - b[1] as f32;
+    let db = a[2] as f32 - b[2] as f32;
+    dr * dr + dg * dg + db * db
+}
+
+fn pick_tincture(rng: &mut Rng, count: usize) -> Vec<Rgb> {
+    let mut out: Vec<Rgb> = Vec::with_capacity(count);
+    let start_metal = rng.range(2) == 0;
+    let first = if start_metal {
+        METALS[rng.range(METALS.len() as u32) as usize]
+    } else {
+        COLORS[rng.range(COLORS.len() as u32) as usize]
+    };
+    out.push(first);
+    let mut is_metal = start_metal;
+    for _ in 1..count {
+        is_metal = !is_metal;
+        let pool: &[Rgb] = if is_metal { METALS } else { COLORS };
+        let prev = *out.last().unwrap();
+        let threshold = 160.0 * 160.0;
+        let mut best = pool[rng.range(pool.len() as u32) as usize];
+        for _ in 0..16 {
+            let c = pool[rng.range(pool.len() as u32) as usize];
+            if color_dist_sq(c, prev) > threshold { best = c; break; }
         }
-        attempts += 1;
+        out.push(best);
     }
-    // Fallback: if we somehow ran out of distinct picks, fill with palette head.
-    while chosen.len() < count {
-        chosen.push(PALETTE[chosen.len() % PALETTE.len()]);
-    }
-    chosen
+    out
 }
 
 // ============================================================
-// Flag layout taxonomy
+// Layout taxonomy with randomized internal parameters
 // ============================================================
+#[derive(Clone)]
 enum Layout {
-    HorizontalStripes(u32), // 2 or 3 bands
-    VerticalStripes,        // 3 bands (tricolor)
-    NordicCross,            // off-center cross
-    Canton,                 // solid + top-left rectangle
+    HorizontalStripes { bands: u32, wide_middle: bool },
+    VerticalStripes { wide_middle: bool },
+    NordicCross { thickness_frac: f32 },
+    Canton,
+    RisingSun { rays: u32, cx_frac: f32, cy_frac: f32 },
+    NordicStar { thickness_frac: f32, star_scale: f32 },
+    Chevron,
 }
 
 fn pick_layout(rng: &mut Rng) -> Layout {
-    match rng.range(4) {
-        0 => Layout::HorizontalStripes(if rng.range(2) == 0 { 2 } else { 3 }),
-        1 => Layout::VerticalStripes,
-        2 => Layout::NordicCross,
-        _ => Layout::Canton,
+    match rng.range(7) {
+        0 => Layout::HorizontalStripes {
+            bands: if rng.range(2) == 0 { 2 } else { 3 },
+            wide_middle: rng.range(3) == 0, // 1-in-3 chance of wide middle
+        },
+        1 => Layout::VerticalStripes {
+            wide_middle: rng.range(3) == 0,
+        },
+        2 => Layout::NordicCross {
+            thickness_frac: 0.10 + rng.next_f32() * 0.08, // 10–18% of min dim
+        },
+        3 => Layout::Canton,
+        4 => {
+            // Rising sun: 6–24 rays, origin anywhere in the flag
+            let origins: [(f32, f32); 5] = [
+                (0.5, 0.5), (0.0, 1.0), (0.0, 0.5), (0.5, 1.0), (0.25, 0.75),
+            ];
+            let o = origins[rng.range(origins.len() as u32) as usize];
+            Layout::RisingSun {
+                rays: rng.range(19) + 6,
+                cx_frac: o.0,
+                cy_frac: o.1,
+            }
+        }
+        5 => Layout::NordicStar {
+            thickness_frac: 0.10 + rng.next_f32() * 0.08,
+            star_scale: 0.08 + rng.next_f32() * 0.10, // 8–18% of min dim
+        },
+        _ => Layout::Chevron,
     }
 }
 
-/// How many distinct base colors a layout needs.
 fn colors_needed(layout: &Layout) -> usize {
     match layout {
-        Layout::HorizontalStripes(n) => *n as usize,
-        Layout::VerticalStripes => 3,
-        Layout::NordicCross | Layout::Canton => 2,
+        Layout::HorizontalStripes { bands, .. } => *bands as usize,
+        Layout::VerticalStripes { .. } => 3,
+        Layout::NordicCross { .. } | Layout::Canton | Layout::Chevron => 2,
+        Layout::RisingSun { .. } => 2,
+        Layout::NordicStar { .. } => 3,
     }
 }
 
-/// Build the deterministic "spec" for a flag from a seed.
-///
-/// Both `generate_procedural_texture` and `describe_layout` route through
-/// here so the rasterised pixels and the SVG export are guaranteed to be
-/// derived from exactly the same RNG draws.
-fn build_flag_spec(seed: f32) -> (Layout, Vec<Rgb>, f32) {
-    let mut rng = Rng::from_seed_f32(seed);
-    let layout = pick_layout(&mut rng);
-    let palette = pick_distinct(&mut rng, colors_needed(&layout));
-    // Fabric phase, also seed-derived → folds shift with the slider.
-    let phase = rng.next_f32() * core::f32::consts::PI * 2.0;
-    (layout, palette, phase)
+// ============================================================
+// SDF: 5-pointed star (negative inside)
+// ============================================================
+#[inline]
+fn sdf_star5(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
+    let x = (px - cx) / r;
+    let y = (py - cy) / r;
+    const AN: f32 = 0.628_318; // pi/5
+    let mut angle = y.atan2(x);
+    if angle < 0.0 { angle += core::f32::consts::TAU; }
+    let sector = AN * 2.0;
+    angle = angle % sector;
+    if angle > AN { angle = sector - angle; }
+    let len = (x * x + y * y).sqrt();
+    let sx = len * angle.cos();
+    let sy = len * angle.sin();
+    let inner_r: f32 = 0.38;
+    let lx = 1.0 - inner_r * AN.cos();
+    let ly = inner_r * AN.sin();
+    let ll = (lx * lx + ly * ly).sqrt();
+    let nx = ly / ll;
+    let ny = -lx / ll;
+    ((sx - 1.0) * nx + sy * ny) * r
 }
 
-/// Resolve which color a pixel gets purely from the geometric layout.
+// ============================================================
+// Zone color at continuous (floating-point) coordinates
+// ============================================================
 #[inline]
-fn zone_color(
-    layout: &Layout,
-    palette: &[Rgb],
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-) -> Rgb {
+fn zone_color_f(layout: &Layout, palette: &[Rgb], fx: f32, fy: f32, w: f32, h: f32) -> Rgb {
     match layout {
-        Layout::HorizontalStripes(n) => {
-            let band = ((y * *n) / height).min(*n - 1);
-            palette[band as usize % palette.len()]
-        }
-        Layout::VerticalStripes => {
-            let band = ((x * 3) / width).min(2);
-            palette[band as usize % palette.len()]
-        }
-        Layout::NordicCross => {
-            // Off-center vertical bar at ~5/12 from left,
-            // horizontal bar centered. Thickness ~1/7 of min dim.
-            let cross_x = (width * 5) / 12;
-            let cross_y = height / 2;
-            let thickness = width.min(height) / 7;
-            let dx = (x as i32 - cross_x as i32).abs() as u32;
-            let dy = (y as i32 - cross_y as i32).abs() as u32;
-            if dx < thickness || dy < thickness {
-                palette[1]
+        Layout::HorizontalStripes { bands, wide_middle } => {
+            let n = *bands;
+            let band = if *wide_middle && n == 3 {
+                // Middle band is 50%, outer bands 25% each
+                if fy < 0.25 { 0 } else if fy < 0.75 { 1 } else { 2 }
             } else {
-                palette[0]
-            }
+                ((fy * n as f32) as u32).min(n - 1)
+            };
+            palette[band as usize % palette.len()]
+        }
+        Layout::VerticalStripes { wide_middle } => {
+            let band = if *wide_middle {
+                if fx < 0.25 { 0 } else if fx < 0.75 { 1 } else { 2 }
+            } else {
+                ((fx * 3.0) as u32).min(2)
+            };
+            palette[band as usize % palette.len()]
+        }
+        Layout::NordicCross { thickness_frac } => {
+            let cross_x = w * (5.0 / 12.0);
+            let cross_y = h * 0.5;
+            let thickness = w.min(h) * thickness_frac;
+            let dx = (fx * w - cross_x).abs();
+            let dy = (fy * h - cross_y).abs();
+            if dx < thickness || dy < thickness { palette[1] } else { palette[0] }
         }
         Layout::Canton => {
-            // Canton is ~2/5 width × 1/2 height in the top-left.
-            let canton_w = (width * 2) / 5;
-            let canton_h = height / 2;
-            if x < canton_w && y < canton_h {
-                palette[1]
-            } else {
-                palette[0]
-            }
+            let cw = 0.4;
+            let ch = 0.5;
+            if fx < cw && fy < ch { palette[1] } else { palette[0] }
+        }
+        Layout::RisingSun { rays, cx_frac, cy_frac } => {
+            let cx = w * cx_frac;
+            let cy = h * cy_frac;
+            let dx = fx * w - cx;
+            let dy = fy * h - cy;
+            let mut angle = dy.atan2(dx);
+            if angle < 0.0 { angle += core::f32::consts::TAU; }
+            let sector = core::f32::consts::TAU / (*rays as f32);
+            let idx = (angle / sector) as u32 % 2;
+            palette[idx as usize]
+        }
+        Layout::NordicStar { thickness_frac, star_scale } => {
+            let cross_x = w * (5.0 / 12.0);
+            let cross_y = h * 0.5;
+            let thickness = w.min(h) * thickness_frac;
+            let dx = (fx * w - cross_x).abs();
+            let dy = (fy * h - cross_y).abs();
+            let on_cross = dx < thickness || dy < thickness;
+            let star_r = w.min(h) * star_scale;
+            let d = sdf_star5(fx * w, fy * h, cross_x, cross_y, star_r);
+            if d < 0.0 { palette[2] } else if on_cross { palette[1] } else { palette[0] }
+        }
+        Layout::Chevron => {
+            let apex_x = 0.4;
+            let rel_y = (fy - 0.5).abs() / 0.5;
+            let edge_x = apex_x * (1.0 - rel_y);
+            if fx < edge_x { palette[1] } else { palette[0] }
         }
     }
 }
 
 // ============================================================
-// Fabric folds — softened "flat-nylon" pass.
-//
-// Previous iteration mapped to roughly [0.55, 1.20] (a 65 % swing)
-// and used `|wave|^0.45` for the body, which sharpened zero-crossings
-// into hard creases. The result read as glossy clay, not cloth.
-//
-// This pass keeps the directional drape geometry but:
-//   • drops the abs/pow shaping in favour of a *linear* sinusoidal body,
-//     which is what a gently lit flat fabric actually looks like;
-//   • lowers the primary frequency so folds are broader and calmer;
-//   • compresses the multiplier range to ~[0.90, 1.04] (~14 % swing),
-//     about a quarter of the original amplitude;
-//   • keeps a narrow specular highlight, but at low amplitude so it
-//     reads as nylon sheen rather than vinyl reflection.
+// Fabric deformation & shading
 // ============================================================
 #[inline]
-fn fabric_modifier(fx: f32, fy: f32, phase: f32) -> f32 {
-    // Primary vertical drapes, warped horizontally by a slow Y-sine.
-    // Lower frequency than before (26 vs 44) → broader, softer folds.
-    let primary =
-        (fx * 26.0 + (fy * 6.0 + phase).sin() * 1.2 + phase * 0.3).cos();
+fn fabric_deform(fx: f32, fy: f32, phase: f32) -> (f32, f32) {
+    let dx = (fx * 18.0 + (fy * 5.0 + phase).sin() * 1.5 + phase * 0.3).sin() * 0.006;
+    let dy = (fy * 12.0 + fx * 4.0 + phase * 0.5).sin() * 0.003;
+    (fx + dx, fy + dy)
+}
 
-    // Subtle diagonal cross-bands (different freq → no resonance).
+#[inline]
+fn fabric_shade(fx: f32, fy: f32, phase: f32) -> f32 {
+    let primary = (fx * 26.0 + (fy * 6.0 + phase).sin() * 1.2 + phase * 0.3).cos();
     let cross = (fx * 9.0 + fy * 14.0 + phase * 0.7).cos();
-
-    // Combined directional wave in roughly [-1, 1].
     let wave = primary * 0.8 + cross * 0.2;
-
-    // Linear body shading. `0.5 + 0.5 * wave` is in [0, 1] and varies
-    // smoothly — no abs/pow shaping → no harsh creases.
     let body = 0.5 + 0.5 * wave;
-
-    // Narrow, low-amplitude specular pop on positive crests.
     let spec = wave.max(0.0).powf(10.0);
-
-    // Final per-channel multiplier: gentle ripple, not 3D plastic.
     0.90 + body * 0.10 + spec * 0.04
 }
 
 #[inline]
-fn shade_channel(channel: u8, modifier: f32) -> u8 {
-    (channel as f32 * modifier).clamp(0.0, 255.0) as u8
+fn shade_channel(ch: u8, m: f32) -> u8 { (ch as f32 * m).clamp(0.0, 255.0) as u8 }
+
+// ============================================================
+// Shared spec builder
+// ============================================================
+fn build_flag_spec(seed: f32) -> (Layout, Vec<Rgb>, f32) {
+    let mut rng = Rng::from_seed_f32(seed);
+    let layout = pick_layout(&mut rng);
+    let palette = pick_tincture(&mut rng, colors_needed(&layout));
+    let phase = rng.next_f32() * core::f32::consts::TAU;
+    (layout, palette, phase)
 }
+
+// ============================================================
+// 2×2 SSAA sub-pixel offsets
+// ============================================================
+const SSAA_OFFSETS: [(f32, f32); 4] = [
+    (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75),
+];
 
 // ============================================================
 // Public WASM API
 // ============================================================
-
-/// Rasterise a flag into an RGBA byte buffer.
-///
-/// When `enable_fabric_shading` is `false`, the geometric zone colors
-/// are emitted verbatim — pure flat output suitable for vector export
-/// and crisp UI previews. When `true`, the softened fabric shader is
-/// applied per pixel.
 #[wasm_bindgen]
 pub fn generate_procedural_texture(
-    width: u32,
-    height: u32,
-    seed: f32,
-    enable_fabric_shading: bool,
+    width: u32, height: u32, seed: f32, enable_fabric_shading: bool,
 ) -> Vec<u8> {
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
+    if width == 0 || height == 0 { return Vec::new(); }
 
     let (layout, palette, phase) = build_flag_spec(seed);
-
     let len = (width as usize) * (height as usize) * 4;
     let mut pixels = Vec::with_capacity(len);
-
     let w = width as f32;
     let h = height as f32;
 
     for y in 0..height {
-        let fy = y as f32 / h;
         for x in 0..width {
-            let fx = x as f32 / w;
+            // 2×2 SSAA: sample geometry at 4 sub-pixel positions, average.
+            let mut r_acc: u32 = 0;
+            let mut g_acc: u32 = 0;
+            let mut b_acc: u32 = 0;
 
-            // Step A — base color from geometric layout.
-            let base = zone_color(&layout, &palette, x, y, width, height);
+            for &(ox, oy) in &SSAA_OFFSETS {
+                let sfx = (x as f32 + ox) / w;
+                let sfy = (y as f32 + oy) / h;
+
+                let (lfx, lfy) = if enable_fabric_shading {
+                    fabric_deform(sfx, sfy, phase)
+                } else {
+                    (sfx, sfy)
+                };
+
+                let c = zone_color_f(&layout, &palette, lfx, lfy, w, h);
+                r_acc += c[0] as u32;
+                g_acc += c[1] as u32;
+                b_acc += c[2] as u32;
+            }
+
+            let r = (r_acc / 4) as u8;
+            let g = (g_acc / 4) as u8;
+            let b = (b_acc / 4) as u8;
 
             if enable_fabric_shading {
-                // Step B — soft fabric modulation per pixel.
-                let m = fabric_modifier(fx, fy, phase);
-                pixels.push(shade_channel(base[0], m));
-                pixels.push(shade_channel(base[1], m));
-                pixels.push(shade_channel(base[2], m));
+                // Apply shade AFTER averaging for consistent sheen
+                let fx = (x as f32 + 0.5) / w;
+                let fy = (y as f32 + 0.5) / h;
+                let m = fabric_shade(fx, fy, phase);
+                pixels.push(shade_channel(r, m));
+                pixels.push(shade_channel(g, m));
+                pixels.push(shade_channel(b, m));
             } else {
-                // Flat mode — pure geometric colors, no shading.
-                pixels.push(base[0]);
-                pixels.push(base[1]);
-                pixels.push(base[2]);
+                pixels.push(r);
+                pixels.push(g);
+                pixels.push(b);
             }
             pixels.push(255);
         }
     }
-
     pixels
 }
 
-/// Describe the layout and palette that `generate_procedural_texture`
-/// would produce for the given seed.
-///
-/// Returns a small JSON document the JS side can parse and turn into a
-/// pure-vector SVG. Format:
-///
-/// ```json
-/// { "type": "horizontal_stripes", "bands": 3, "colors": ["#aabbcc", ...] }
-/// { "type": "vertical_stripes",   "bands": 3, "colors": [ ... ] }
-/// { "type": "nordic_cross",                     "colors": [bg, cross] }
-/// { "type": "canton",                           "colors": [field, canton] }
-/// ```
+/// JSON layout descriptor for SVG export.
 #[wasm_bindgen]
 pub fn describe_layout(seed: f32) -> String {
-    let (layout, palette, _phase) = build_flag_spec(seed);
+    let (layout, palette, _) = build_flag_spec(seed);
 
-    let colors_json = palette
-        .iter()
-        .map(|rgb| format!("\"#{:02x}{:02x}{:02x}\"", rgb[0], rgb[1], rgb[2]))
-        .collect::<Vec<_>>()
-        .join(",");
+    let colors_json = palette.iter()
+        .map(|c| format!("\"#{:02x}{:02x}{:02x}\"", c[0], c[1], c[2]))
+        .collect::<Vec<_>>().join(",");
 
     match layout {
-        Layout::HorizontalStripes(n) => format!(
-            "{{\"type\":\"horizontal_stripes\",\"bands\":{},\"colors\":[{}]}}",
-            n, colors_json
-        ),
-        Layout::VerticalStripes => format!(
-            "{{\"type\":\"vertical_stripes\",\"bands\":3,\"colors\":[{}]}}",
-            colors_json
-        ),
-        Layout::NordicCross => format!(
-            "{{\"type\":\"nordic_cross\",\"colors\":[{}]}}",
-            colors_json
-        ),
+        Layout::HorizontalStripes { bands, wide_middle } => format!(
+            "{{\"type\":\"horizontal_stripes\",\"bands\":{},\"wideMiddle\":{},\"colors\":[{}]}}",
+            bands, wide_middle, colors_json),
+        Layout::VerticalStripes { wide_middle } => format!(
+            "{{\"type\":\"vertical_stripes\",\"bands\":3,\"wideMiddle\":{},\"colors\":[{}]}}",
+            wide_middle, colors_json),
+        Layout::NordicCross { thickness_frac } => format!(
+            "{{\"type\":\"nordic_cross\",\"thicknessFrac\":{:.4},\"colors\":[{}]}}",
+            thickness_frac, colors_json),
         Layout::Canton => format!(
-            "{{\"type\":\"canton\",\"colors\":[{}]}}",
-            colors_json
-        ),
+            "{{\"type\":\"canton\",\"colors\":[{}]}}", colors_json),
+        Layout::RisingSun { rays, cx_frac, cy_frac } => format!(
+            "{{\"type\":\"rising_sun\",\"rays\":{},\"cxFrac\":{:.4},\"cyFrac\":{:.4},\"colors\":[{}]}}",
+            rays, cx_frac, cy_frac, colors_json),
+        Layout::NordicStar { thickness_frac, star_scale } => format!(
+            "{{\"type\":\"nordic_star\",\"thicknessFrac\":{:.4},\"starScale\":{:.4},\"colors\":[{}]}}",
+            thickness_frac, star_scale, colors_json),
+        Layout::Chevron => format!(
+            "{{\"type\":\"chevron\",\"colors\":[{}]}}", colors_json),
     }
 }
 
@@ -324,53 +371,40 @@ pub fn apply_flag_filter(mut pixels: Vec<u8>, filter_type: String) -> Vec<u8> {
     match filter_type.as_str() {
         "grayscale" => {
             for i in 0..num_pixels {
-                let base = i * 4;
-                let lum = (pixels[base] as f32 * 0.299
-                    + pixels[base + 1] as f32 * 0.587
-                    + pixels[base + 2] as f32 * 0.114) as u8;
-                pixels[base] = lum;
-                pixels[base + 1] = lum;
-                pixels[base + 2] = lum;
+                let b = i * 4;
+                let lum = (pixels[b] as f32 * 0.299
+                    + pixels[b+1] as f32 * 0.587
+                    + pixels[b+2] as f32 * 0.114) as u8;
+                pixels[b] = lum; pixels[b+1] = lum; pixels[b+2] = lum;
             }
         }
         "invert" => {
             for i in 0..num_pixels {
-                let base = i * 4;
-                pixels[base] = 255 - pixels[base];
-                pixels[base + 1] = 255 - pixels[base + 1];
-                pixels[base + 2] = 255 - pixels[base + 2];
+                let b = i * 4;
+                pixels[b] = 255 - pixels[b];
+                pixels[b+1] = 255 - pixels[b+1];
+                pixels[b+2] = 255 - pixels[b+2];
             }
         }
         "vignette" => {
-            // Recover dimensions from pixel count assuming square-ish buffer.
             let side = (num_pixels as f32).sqrt();
             let width = side as u32;
-            let height = if width > 0 {
-                num_pixels as u32 / width
-            } else {
-                1
-            };
-
+            let height = if width > 0 { num_pixels as u32 / width } else { 1 };
             let cx = width as f32 / 2.0;
             let cy = height as f32 / 2.0;
             let max_dist = (cx * cx + cy * cy).sqrt();
-
             for i in 0..num_pixels {
-                let x = (i as u32 % width) as f32;
-                let y = (i as u32 / width) as f32;
-                let dx = x - cx;
-                let dy = y - cy;
-                let dist = (dx * dx + dy * dy).sqrt() / max_dist;
-                let factor = (1.0 - (dist * dist * 1.2)).max(0.0);
-
-                let base = i * 4;
-                pixels[base] = (pixels[base] as f32 * factor) as u8;
-                pixels[base + 1] = (pixels[base + 1] as f32 * factor) as u8;
-                pixels[base + 2] = (pixels[base + 2] as f32 * factor) as u8;
+                let px = (i as u32 % width) as f32;
+                let py = (i as u32 / width) as f32;
+                let d = ((px-cx)*(px-cx) + (py-cy)*(py-cy)).sqrt() / max_dist;
+                let f = (1.0 - d * d * 1.2).max(0.0);
+                let b = i * 4;
+                pixels[b] = (pixels[b] as f32 * f) as u8;
+                pixels[b+1] = (pixels[b+1] as f32 * f) as u8;
+                pixels[b+2] = (pixels[b+2] as f32 * f) as u8;
             }
         }
-        _ => {} // unknown filter — return unchanged
+        _ => {}
     }
-
     pixels
 }
